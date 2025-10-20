@@ -42,9 +42,6 @@ type CoreController struct {
 	coreInstance    *core.Instance
 	IsRunning       bool
 	dialer          *ProtectedDialer
-	closeChan       chan struct{}
-	DomainName      string
-	AsyncResolve    bool
 }
 
 // CoreCallbackHandler defines interface for receiving callbacks and notifications from the core service
@@ -95,7 +92,7 @@ func InitCoreEnv(envPath string, key string) {
 
 // NewCoreController initializes and returns a new CoreController instance
 // Sets up the console log handler and associates it with the provided callback handler
-func NewCoreController(s CoreCallbackHandler, asyncResolve bool) *CoreController {
+func NewCoreController(s CoreCallbackHandler) *CoreController {
 	// Register custom logger
 	if err := coreapplog.RegisterHandlerCreator(
 		coreapplog.LogType_Console,
@@ -112,52 +109,19 @@ func NewCoreController(s CoreCallbackHandler, asyncResolve bool) *CoreController
 	return &CoreController{
 		CallbackHandler: s,
 		dialer:          dialer,
-		AsyncResolve:    asyncResolve,
 	}
 }
 
 // StartLoop initializes and starts the core processing loop
 // Thread-safe method that configures and runs the Xray core with the provided configuration
 // Returns immediately if the core is already running
-func (x *CoreController) StartLoop(configContent string, domainName string, prefIPv6 bool) (err error) {
+func (x *CoreController) StartLoop(configContent string) (err error) {
 	x.coreMutex.Lock()
 	defer x.coreMutex.Unlock()
 
 	if x.IsRunning {
 		log.Println("Core is already running")
 		return nil
-	}
-
-	x.DomainName = domainName
-	
-	if x.DomainName != "" {
-		x.closeChan = make(chan struct{})
-		x.dialer.PrepareResolveChan()
-		
-		go func() {
-			select {
-			// wait until resolved
-			case <-x.dialer.ResolveChan():
-				// shutdown VPNService if server name cannot be resolved
-				if !x.dialer.IsVServerReady() {
-					log.Println("vServer cannot be resolved, shutdown")
-					x.StopLoop()
-					x.CallbackHandler.Shutdown()
-				}
-			// stop waiting if manually closed
-			case <-x.closeChan:
-			}
-		}()
-
-		if x.AsyncResolve {
-			go func() {
-				x.dialer.PrepareDomain(x.DomainName, x.closeChan, prefIPv6)
-				close(x.dialer.ResolveChan())
-			}()
-		} else {
-			x.dialer.PrepareDomain(x.DomainName, x.closeChan, prefIPv6)
-			close(x.dialer.ResolveChan())
-		}
 	}
 
 	return x.doStartLoop(configContent)
@@ -170,9 +134,6 @@ func (x *CoreController) StopLoop() error {
 	defer x.coreMutex.Unlock()
 
 	if x.IsRunning {
-		if x.closeChan != nil {
-			close(x.closeChan)
-		}
 		x.doShutdown()
 		x.CallbackHandler.OnEmitStatus(0, "Core stopped")
 	}
