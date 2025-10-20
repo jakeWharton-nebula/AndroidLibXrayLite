@@ -23,6 +23,7 @@ import (
 	corestats "github.com/xtls/xray-core/features/stats"
 	coreserial "github.com/xtls/xray-core/infra/conf/serial"
 	_ "github.com/xtls/xray-core/main/distro/all"
+	v2internet "github.com/xtls/xray-core/transport/internet"
 	mobasset "golang.org/x/mobile/asset"
 )
 
@@ -40,12 +41,17 @@ type CoreController struct {
 	coreMutex       sync.Mutex
 	coreInstance    *core.Instance
 	IsRunning       bool
+	dialer          *ProtectedDialer
+	closeChan       chan struct{}
+	DomainName      string
+	AsyncResolve    bool
 }
 
 // CoreCallbackHandler defines interface for receiving callbacks and notifications from the core service
 type CoreCallbackHandler interface {
 	Startup() int
 	Shutdown() int
+	Protect(int) bool
 	OnEmitStatus(int, string) int
 }
 
@@ -89,7 +95,7 @@ func InitCoreEnv(envPath string, key string) {
 
 // NewCoreController initializes and returns a new CoreController instance
 // Sets up the console log handler and associates it with the provided callback handler
-func NewCoreController(s CoreCallbackHandler) *CoreController {
+func NewCoreController(s CoreCallbackHandler, asyncResolve bool) *CoreController {
 	// Register custom logger
 	if err := coreapplog.RegisterHandlerCreator(
 		coreapplog.LogType_Console,
@@ -100,21 +106,58 @@ func NewCoreController(s CoreCallbackHandler) *CoreController {
 		log.Printf("Failed to register log handler: %v", err)
 	}
 
+	dialer := NewProtectedDialer(s)
+	v2internet.UseAlternativeSystemDialer(dialer)
+
 	return &CoreController{
 		CallbackHandler: s,
+		dialer:          dialer,
+		AsyncResolve:    asyncResolve,
 	}
 }
 
 // StartLoop initializes and starts the core processing loop
 // Thread-safe method that configures and runs the Xray core with the provided configuration
 // Returns immediately if the core is already running
-func (x *CoreController) StartLoop(configContent string) (err error) {
+func (x *CoreController) StartLoop(configContent string, domainName string, prefIPv6 bool) (err error) {
 	x.coreMutex.Lock()
 	defer x.coreMutex.Unlock()
 
 	if x.IsRunning {
 		log.Println("Core is already running")
 		return nil
+	}
+
+	x.DomainName = domainName
+	
+	if x.DomainName != "" {
+		x.closeChan = make(chan struct{})
+		x.dialer.PrepareResolveChan()
+		
+		go func() {
+			select {
+			// wait until resolved
+			case <-x.dialer.ResolveChan():
+				// shutdown VPNService if server name cannot be resolved
+				if !x.dialer.IsVServerReady() {
+					log.Println("vServer cannot be resolved, shutdown")
+					x.StopLoop()
+					x.CallbackHandler.Shutdown()
+				}
+			// stop waiting if manually closed
+			case <-x.closeChan:
+			}
+		}()
+
+		if x.AsyncResolve {
+			go func() {
+				x.dialer.PrepareDomain(x.DomainName, x.closeChan, prefIPv6)
+				close(x.dialer.ResolveChan())
+			}()
+		} else {
+			x.dialer.PrepareDomain(x.DomainName, x.closeChan, prefIPv6)
+			close(x.dialer.ResolveChan())
+		}
 	}
 
 	return x.doStartLoop(configContent)
@@ -127,6 +170,9 @@ func (x *CoreController) StopLoop() error {
 	defer x.coreMutex.Unlock()
 
 	if x.IsRunning {
+		if x.closeChan != nil {
+			close(x.closeChan)
+		}
 		x.doShutdown()
 		x.CallbackHandler.OnEmitStatus(0, "Core stopped")
 	}
