@@ -122,6 +122,10 @@ func (d *ProtectedDialer) Dial(ctx context.Context,
 	return d.fdConn(ctx, resolved.IPs[0], resolved.Port, dest.Network, fd)
 }
 
+func (d *ProtectedDialer) DestIpAddress() net.IP {
+	// Return nil since we don't cache server IPs anymore
+	return nil
+}
 
 func (d *ProtectedDialer) fdConn(ctx context.Context, ip net.IP, port int, network v2net.Network, fd int) (net.Conn, error) {
 
